@@ -14,8 +14,8 @@ from dotenv import load_dotenv
 # ================= CONFIG =================
 load_dotenv()
 
-client_id = os.getenv("CLIENT_ID")
-secret_key = os.getenv("SECRET_KEY")
+client_id = ""
+secret_key = ""
 redirect_uri = "https://trade.fyers.in/api-login/redirect-uri/index.html"
 FYERS_STATE = os.getenv("FYERS_STATE", "sample_state")
 FYERS_NONCE = os.getenv("FYERS_NONCE", "sample_nonce")
