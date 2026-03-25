@@ -8,6 +8,7 @@ import csv
 import json
 import os
 import sys
+from urllib.parse import parse_qs, unquote, urlparse
 from dotenv import load_dotenv
 
 # ================= CONFIG =================
@@ -16,6 +17,8 @@ load_dotenv()
 client_id = os.getenv("CLIENT_ID")
 secret_key = os.getenv("SECRET_KEY")
 redirect_uri = "https://trade.fyers.in/api-login/redirect-uri/index.html"
+FYERS_STATE = os.getenv("FYERS_STATE", "sample_state")
+FYERS_NONCE = os.getenv("FYERS_NONCE", "sample_nonce")
 
 ENTRY_PRICE = 250
 STOPLOSS = 225
@@ -30,6 +33,11 @@ ltp_data = {}
 
 # ================= AUTH =================
 def authenticate():
+    if not client_id or not secret_key:
+        raise RuntimeError(
+            "Missing FYERS credentials. Ensure environment variables CLIENT_ID and SECRET_KEY are set "
+            "(and that your server process actually loads them)."
+        )
 
     def _write_tokens(payload: dict) -> None:
         with open(TOKEN_FILE, "w") as f:
@@ -39,21 +47,58 @@ def authenticate():
         token = payload.get("access_token")
         if token:
             return token
-        # Fyers responses commonly return error details under message/s/code
+        err_status = payload.get("s")
+        err_code = payload.get("code")
+        err_message = payload.get("message")
         raise RuntimeError(
             "Token generation did not return access_token. "
+            f"status={err_status!r}, code={err_code!r}, message={err_message!r}. "
             f"Response keys={sorted(list(payload.keys()))}. "
             f"Full response saved to {TOKEN_FILE!r}."
         )
 
+    def _normalize_auth_code(raw_input: str) -> str:
+        value = (raw_input or "").strip()
+        if not value:
+            return value
+
+        # If user pastes full redirect URL, extract auth_code query param.
+        if "://" in value:
+            parsed = urlparse(value)
+            query = parse_qs(parsed.query)
+            code_from_query = query.get("auth_code", [""])[0].strip()
+            if code_from_query:
+                return unquote(code_from_query)
+
+        # Handle "auth_code=xxxx" pastes directly.
+        if "auth_code=" in value:
+            query = parse_qs(value)
+            code_from_query = query.get("auth_code", [""])[0].strip()
+            if code_from_query:
+                return unquote(code_from_query)
+
+        return unquote(value)
+
     def _generate_from_auth_code() -> str:
-        session = fyersModel.SessionModel(
+        # FYERS authcode generation URL depends on app config. redirect_uri must match exactly
+        # what is configured in the FYERS app dashboard.
+        session_kwargs = dict(
             client_id=client_id,
             secret_key=secret_key,
             redirect_uri=redirect_uri,
             response_type="code",
             grant_type="authorization_code",
         )
+        # Some FYERS examples include state/nonce; pass them if supported by installed SDK.
+        # (If unsupported, SessionModel will raise TypeError and we retry without them.)
+        try:
+            session = fyersModel.SessionModel(
+                **session_kwargs,
+                state=FYERS_STATE,
+                nonce=FYERS_NONCE,
+            )
+        except TypeError:
+            session = fyersModel.SessionModel(**session_kwargs)
 
         auth_url = session.generate_authcode()
         print("Open this URL:\n", auth_url)
@@ -65,10 +110,15 @@ def authenticate():
                 "Set a valid refresh_token in tokens.json or run once interactively to generate it."
             )
 
-        auth_code = input("Enter auth code: ").strip()
+        auth_code_input = input("Enter auth code (or full redirect URL): ").strip()
+        auth_code = _normalize_auth_code(auth_code_input)
+        if not auth_code:
+            raise RuntimeError("Empty auth code received. Please paste a valid auth code/redirect URL.")
         session.set_token(auth_code)
         response = session.generate_token() or {}
         _write_tokens(response)
+        if not response.get("access_token"):
+            print("FYERS token error:", response.get("code"), response.get("message"))
         return _extract_access_token(response)
 
     def _refresh_from_refresh_token(refresh_token: str) -> str:
@@ -82,6 +132,8 @@ def authenticate():
         session.set_token(refresh_token)
         response = session.generate_token() or {}
         _write_tokens(response)
+        if not response.get("access_token"):
+            print("FYERS refresh error:", response.get("code"), response.get("message"))
         return _extract_access_token(response)
 
     # Try using saved token
