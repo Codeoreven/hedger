@@ -7,6 +7,7 @@ import threading
 import csv
 import json
 import os
+import sys
 from dotenv import load_dotenv
 
 # ================= CONFIG =================
@@ -30,34 +31,58 @@ ltp_data = {}
 # ================= AUTH =================
 def authenticate():
 
-    def generate_new_token():
-        session = fyersModel.SessionModel(
-            client_id=client_id,
-            secret_key=secret_key,
-            redirect_uri=redirect_uri,
-            response_type="code"
+    def _write_tokens(payload: dict) -> None:
+        with open(TOKEN_FILE, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+
+    def _extract_access_token(payload: dict) -> str:
+        token = payload.get("access_token")
+        if token:
+            return token
+        # Fyers responses commonly return error details under message/s/code
+        raise RuntimeError(
+            "Token generation did not return access_token. "
+            f"Response keys={sorted(list(payload.keys()))}. "
+            f"Full response saved to {TOKEN_FILE!r}."
         )
 
-        auth_url = session.generate_authcode()
-        print("Open this URL:\n", auth_url)
-
-        auth_code = input("Enter auth code: ")
-
+    def _generate_from_auth_code() -> str:
         session = fyersModel.SessionModel(
             client_id=client_id,
             secret_key=secret_key,
             redirect_uri=redirect_uri,
             response_type="code",
-            grant_type="authorization_code"
+            grant_type="authorization_code",
         )
 
+        auth_url = session.generate_authcode()
+        print("Open this URL:\n", auth_url)
+
+        # On servers (systemd/cron/docker), stdin is often non-interactive.
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                "Cannot prompt for auth code (non-interactive). "
+                "Set a valid refresh_token in tokens.json or run once interactively to generate it."
+            )
+
+        auth_code = input("Enter auth code: ").strip()
         session.set_token(auth_code)
-        response = session.generate_token()
+        response = session.generate_token() or {}
+        _write_tokens(response)
+        return _extract_access_token(response)
 
-        with open(TOKEN_FILE, "w") as f:
-            json.dump(response, f)
-
-        return response["access_token"]
+    def _refresh_from_refresh_token(refresh_token: str) -> str:
+        session = fyersModel.SessionModel(
+            client_id=client_id,
+            secret_key=secret_key,
+            redirect_uri=redirect_uri,
+            response_type="code",
+            grant_type="refresh_token",
+        )
+        session.set_token(refresh_token)
+        response = session.generate_token() or {}
+        _write_tokens(response)
+        return _extract_access_token(response)
 
     # Try using saved token
     if os.path.exists(TOKEN_FILE):
@@ -65,25 +90,35 @@ def authenticate():
             tokens = json.load(f)
 
         access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
 
-        fyers_test = fyersModel.FyersModel(
-            client_id=client_id,
-            is_async=False,
-            token=access_token,
-            log_path=""
-        )
+        if access_token:
+            fyers_test = fyersModel.FyersModel(
+                client_id=client_id,
+                is_async=False,
+                token=access_token,
+                log_path="",
+            )
 
-        profile = fyers_test.get_profile()
+            profile = fyers_test.get_profile()
 
-        # ✅ check if token works
-        if profile.get("s") == "ok":
-            print("Using valid saved token")
-            return access_token
-        else:
-            print("Saved token expired. Regenerating...")
+            # ✅ check if token works
+            if profile.get("s") == "ok":
+                print("Using valid saved token")
+                return access_token
+            else:
+                print("Saved token invalid/expired.")
+
+        if refresh_token:
+            print("Refreshing access token using refresh_token...")
+            try:
+                return _refresh_from_refresh_token(refresh_token)
+            except Exception as e:
+                print("Refresh failed:", str(e))
 
     # Generate new token
-    return generate_new_token()
+    print("Generating new token using auth code flow...")
+    return _generate_from_auth_code()
 
 # ================= TIME =================
 def wait_for_market_open():
